@@ -5751,7 +5751,7 @@ async fn execute_on_pool_once(
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => {
             let client = client.clone();
-            client.execute(None, sql.to_string(), max_rows, None, query_timeout).await
+            client.execute(None, None, sql.to_string(), max_rows, None, query_timeout).await
         }
         _ => Err("Unsupported database type for transfer".to_string()),
     };

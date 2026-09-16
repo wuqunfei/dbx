@@ -55,6 +55,7 @@ impl DuckDbWorkerSession {
             &locked,
             &self.attached_names,
             params.database.as_deref(),
+            params.schema.as_deref(),
             &params.sql,
             params.max_rows,
         )?;
@@ -534,7 +535,12 @@ mod tests {
             .expect("connect");
 
         let result = session
-            .execute(DuckDbWorkerExecuteParams { sql: "SELECT 1 AS value".to_string(), database: None, max_rows: None })
+            .execute(DuckDbWorkerExecuteParams {
+                sql: "SELECT 1 AS value".to_string(),
+                database: None,
+                schema: None,
+                max_rows: None,
+            })
             .expect("execute");
 
         assert_eq!(result.columns, vec!["value"]);
@@ -559,6 +565,7 @@ mod tests {
                       CREATE TABLE analytics.items (id INTEGER)"
                     .to_string(),
                 database: None,
+                schema: None,
                 max_rows: None,
             })
             .expect("create table");
@@ -604,6 +611,7 @@ mod tests {
             .execute(DuckDbWorkerExecuteParams {
                 sql: "CREATE VIEW active_orders AS SELECT 1 AS id".to_string(),
                 database: None,
+                schema: None,
                 max_rows: None,
             })
             .expect("create view");
@@ -756,6 +764,7 @@ mod tests {
             .execute(DuckDbWorkerExecuteParams {
                 sql: format!("ATTACH '{}' AS \"sales db\";", attached_path.to_string_lossy().replace('\'', "''")),
                 database: None,
+                schema: None,
                 max_rows: None,
             })
             .expect("attach sql");

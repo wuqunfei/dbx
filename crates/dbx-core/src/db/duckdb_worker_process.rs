@@ -216,17 +216,21 @@ impl DuckDbWorkerClient {
     pub async fn execute(
         &self,
         database: Option<String>,
+        schema: Option<String>,
         sql: String,
         max_rows: Option<usize>,
         cancel_token: Option<CancellationToken>,
         query_timeout: Option<Duration>,
     ) -> Result<db::QueryResult, String> {
-        self.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await.map_err(|error| error.message)
+        self.execute_typed(database, schema, sql, max_rows, cancel_token, query_timeout)
+            .await
+            .map_err(|error| error.message)
     }
 
     pub async fn execute_typed(
         &self,
         database: Option<String>,
+        schema: Option<String>,
         sql: String,
         max_rows: Option<usize>,
         cancel_token: Option<CancellationToken>,
@@ -251,7 +255,7 @@ impl DuckDbWorkerClient {
             match client
                 .send_request_structured::<db::QueryResult>(
                     DuckDbWorkerMethod::Execute,
-                    DuckDbWorkerExecuteParams { sql, database, max_rows },
+                    DuckDbWorkerExecuteParams { sql, database, schema, max_rows },
                     None,
                 )
                 .await

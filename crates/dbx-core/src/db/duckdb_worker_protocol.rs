@@ -119,6 +119,11 @@ pub struct DuckDbWorkerExecuteParams {
     pub sql: String,
     #[serde(default)]
     pub database: Option<String>,
+    /// Schema to set as current within `database` before running `sql`, so an
+    /// unqualified table reference resolves the way the caller picked it — not
+    /// whatever schema this shared connection was last left in by another query.
+    #[serde(default)]
+    pub schema: Option<String>,
     #[serde(default)]
     pub max_rows: Option<usize>,
 }
