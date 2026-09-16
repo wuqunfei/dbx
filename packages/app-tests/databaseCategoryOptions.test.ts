@@ -80,6 +80,28 @@ test("restrictToDbTypes limits the picker to exactly the given database types", 
     /!props\.restrictToDbTypes \|\| props\.restrictToDbTypes\.includes\(option\.value as DatabaseType\)/,
     "dbCategories should filter options by restrictToDbTypes",
   );
-  assert.match(source, /\.filter\(\(category\) => category\.options\.length > 0\)/, "dbCategories should drop categories left empty after the restriction filter");
-  assert.match(source, /if \(props\.restrictToDbTypes\) return categories;/, "dbCategories should skip plugin providers when restrictToDbTypes is set");
+  assert.match(
+    source,
+    /if \(props\.restrictToDbTypes\) return categories\.filter\(\(category\) => category\.options\.length > 0\);/,
+    "dbCategories should drop empty categories only on the restricted path, and skip plugin providers when restrictToDbTypes is set",
+  );
+});
+
+test("ConnectionDialog dbCategories applies the empty-category filter only on the restricted path", () => {
+  // Guards against the empty-category `.filter()` being hoisted so it runs
+  // unconditionally (including on the default/unrestricted path), which would
+  // silently drop categories from the default picker if a category ever ended
+  // up empty after the (no-op-when-unrestricted) per-option filter predicate.
+  // The unrestricted `categories` array must be built with no `.filter()` on
+  // it at all, so pluginOptions.push() always operates on the full,
+  // unfiltered category list.
+  const dialogPath = join(dirname(fileURLToPath(import.meta.url)), "../../apps/desktop/src/components/connection/ConnectionDialog.vue");
+  const source = readFileSync(dialogPath, "utf8");
+  const computedMatch = source.match(/const dbCategories = computed<DbCategory\[\]>\(\(\) => \{([\s\S]*?)\n\}\);/);
+  assert.ok(computedMatch, "dbCategories computed block should be found");
+  const body = computedMatch[1];
+  const restrictedReturnIndex = body.indexOf("if (props.restrictToDbTypes) return categories.filter(");
+  assert.ok(restrictedReturnIndex >= 0, "restricted-path early return should filter out empty categories");
+  const beforeRestrictedReturn = body.slice(0, restrictedReturnIndex);
+  assert.ok(!beforeRestrictedReturn.includes(".filter((category) => category.options.length > 0)"), "the categories array used for the unrestricted path must not be pre-filtered for empty categories");
 });
