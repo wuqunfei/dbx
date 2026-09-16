@@ -261,6 +261,11 @@ pub struct DuckDbWorkerConnectParams {
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     #[serde(default)]
     pub init_script: Option<String>,
+    /// Raw `ATTACH ...`/`DETACH ...` SQL statements accumulated from ad-hoc SQL run
+    /// through `Execute` since this connection pool was created, replayed here so a
+    /// respawned worker process keeps catalogs the SQL text (not the config) attached.
+    #[serde(default)]
+    pub extra_attach_statements: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -301,4 +306,30 @@ pub struct DuckDbWorkerObjectSourceParams {
     pub schema: String,
     pub name: String,
     pub object_type: ObjectSourceKind,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_params_round_trip_extra_attach_statements() {
+        let params = DuckDbWorkerConnectParams {
+            path: ":memory:".to_string(),
+            attached_databases: Vec::new(),
+            init_script: None,
+            extra_attach_statements: vec!["ATTACH 'gc.duckdb' AS gc;".to_string()],
+        };
+        let json = serde_json::to_string(&params).expect("serialize connect params");
+        assert!(json.contains("extraAttachStatements"), "connect params json: {json}");
+        let parsed: DuckDbWorkerConnectParams = serde_json::from_str(&json).expect("parse connect params");
+        assert_eq!(parsed.extra_attach_statements, vec!["ATTACH 'gc.duckdb' AS gc;".to_string()]);
+    }
+
+    #[test]
+    fn connect_params_default_extra_attach_statements_when_absent() {
+        let json = r#"{"path":":memory:","attachedDatabases":[],"initScript":null}"#;
+        let parsed: DuckDbWorkerConnectParams = serde_json::from_str(json).expect("parse legacy connect params");
+        assert!(parsed.extra_attach_statements.is_empty());
+    }
 }

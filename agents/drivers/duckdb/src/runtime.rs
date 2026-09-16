@@ -479,6 +479,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
@@ -493,6 +494,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
@@ -512,6 +514,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
         session
@@ -559,6 +562,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
         session
@@ -597,6 +601,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
@@ -636,6 +641,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: Some(script),
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
@@ -665,6 +671,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: Some(format!("ATTACH '{}';", attached_path.to_string_lossy().replace('\'', "''"))),
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
@@ -685,6 +692,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: Some("SELECT 1; SELECT * FROM missing_table;".to_string()),
+                extra_attach_statements: Vec::new(),
             })
             .expect_err("init script should fail");
         assert!(err.contains("statement 2"), "unexpected error: {err}");
@@ -705,6 +713,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 

@@ -334,6 +334,7 @@ async fn worker_process_exits_when_stdin_closes_during_active_query() {
                 path: db_path.to_string_lossy().to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             },
         )
         .expect("connect request"),

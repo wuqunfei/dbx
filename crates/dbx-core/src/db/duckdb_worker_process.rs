@@ -183,7 +183,12 @@ impl DuckDbWorkerClient {
                 process_limit,
                 executable,
                 executable_args,
-                connect_params: DuckDbWorkerConnectParams { path, attached_databases, init_script },
+                connect_params: DuckDbWorkerConnectParams {
+                    path,
+                    attached_databases,
+                    init_script,
+                    extra_attach_statements: Vec::new(),
+                },
                 request_timeout,
                 worker_start_timeout,
                 next_id: AtomicU64::new(1),
