@@ -310,6 +310,170 @@ async fn worker_process_keeps_session_state_after_benign_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_replays_ad_hoc_attach_after_respawn() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let db_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&db_path);
+    let attached_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&attached_path);
+    let csv_path = temp_csv_path();
+    std::fs::write(&csv_path, "id,name\n7,Ada\n8,Grace\n").expect("write events csv");
+    {
+        // Populate the attached catalog from a real CSV file so this test exercises
+        // externally-sourced data behind an attached catalog, the same shape as the
+        // reported bug's Iceberg/S3 Tables catalog (kept network-free here).
+        let con = duckdb::Connection::open(&attached_path).expect("create attached db");
+        con.execute_batch(&format!(
+            "CREATE TABLE events AS SELECT * FROM read_csv_auto('{}');",
+            csv_path.to_string_lossy().replace('\'', "''")
+        ))
+        .expect("create attached table from csv");
+    }
+
+    let client =
+        DuckDbWorkerClient::open_with_executable(executable, db_path.to_string_lossy().to_string(), Vec::new(), None)
+            .await
+            .expect("worker process connects");
+
+    client
+        .execute(
+            None,
+            format!("ATTACH '{}' AS gc;", attached_path.to_string_lossy().replace('\'', "''")),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("ad-hoc attach");
+
+    // Simulate the worker process dying and respawning between the ATTACH and the next
+    // query that targets it (e.g. the 60s metadata-request timeout firing while an LLM
+    // lists the newly-attached catalog's schemas before querying it).
+    client.kill().await;
+
+    let result = client
+        .execute(
+            Some("gc".to_string()),
+            "SELECT id, name FROM events ORDER BY id".to_string(),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("query against ad-hoc attached catalog should survive a worker respawn");
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![serde_json::json!(7), serde_json::json!("Ada")],
+            vec![serde_json::json!(8), serde_json::json!("Grace")],
+        ]
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&attached_path);
+    let _ = std::fs::remove_file(&csv_path);
+}
+
+/// Opt-in reproduction against a real S3-hosted catalog, matching the exact scenario from
+/// the original bug report (an Iceberg/S3 Tables catalog attached via `httpfs`/`aws`). Set
+/// `DBX_TEST_S3_DUCKDB_ATTACH_URL` to a DuckDB file URL you have read access to (e.g.
+/// `s3://your-bucket/file.duckdb`, with credentials available via the default AWS credential
+/// chain — see `~/.aws` or `AWS_*` env vars) to run this for real. Skipped by default so the
+/// rest of this suite stays network-free and does not depend on any account's credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_replays_ad_hoc_s3_attach_after_respawn() {
+    let Ok(url) = std::env::var("DBX_TEST_S3_DUCKDB_ATTACH_URL") else {
+        eprintln!(
+            "skipping worker_process_replays_ad_hoc_s3_attach_after_respawn: set DBX_TEST_S3_DUCKDB_ATTACH_URL to run"
+        );
+        return;
+    };
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let db_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&db_path);
+
+    let client =
+        DuckDbWorkerClient::open_with_executable(executable, db_path.to_string_lossy().to_string(), Vec::new(), None)
+            .await
+            .expect("worker process connects");
+
+    client
+        .execute(None, "INSTALL httpfs; LOAD httpfs;".to_string(), Some(10), None, Some(Duration::from_secs(30)))
+        .await
+        .expect("load httpfs");
+    client
+        .execute(
+            None,
+            format!("ATTACH '{}' AS gc (READ_ONLY);", url.replace('\'', "''")),
+            Some(10),
+            None,
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .expect("ad-hoc S3 attach");
+
+    // Simulate the worker process dying and respawning between the ATTACH and the next
+    // query, exactly as in the original report.
+    client.kill().await;
+
+    let result = client
+        .execute(Some("gc".to_string()), "SHOW TABLES".to_string(), Some(10), None, Some(Duration::from_secs(30)))
+        .await
+        .expect("query against the S3-attached catalog should survive a worker respawn");
+    assert!(!result.columns.is_empty());
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_does_not_replay_detached_ad_hoc_attach_after_respawn() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let db_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&db_path);
+    let attached_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&attached_path);
+    {
+        let con = duckdb::Connection::open(&attached_path).expect("create attached db");
+        con.execute_batch("CREATE TABLE events (id INTEGER);").expect("create attached table");
+    }
+
+    let client =
+        DuckDbWorkerClient::open_with_executable(executable, db_path.to_string_lossy().to_string(), Vec::new(), None)
+            .await
+            .expect("worker process connects");
+
+    client
+        .execute(
+            None,
+            format!("ATTACH '{}' AS gc;", attached_path.to_string_lossy().replace('\'', "''")),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("ad-hoc attach");
+    client.execute(None, "DETACH gc;".to_string(), Some(10), None, Some(Duration::from_secs(5))).await.expect("detach");
+
+    client.kill().await;
+
+    let databases = client.list_databases().await.expect("list databases after respawn");
+    assert!(
+        !databases.iter().any(|database| database.name == "gc"),
+        "detached catalog should not be replayed after respawn: {databases:?}"
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&attached_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_process_exits_when_stdin_closes_during_active_query() {
     let _guard = duckdb_worker_process_test_guard().await;
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
@@ -587,6 +751,13 @@ fn temp_pid_path() -> PathBuf {
     let pid = std::process::id();
     let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("dbx-duckdb-worker-process-{pid}-{suffix}-{counter}.pid"))
+}
+
+fn temp_csv_path() -> PathBuf {
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let pid = std::process::id();
+    let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("dbx-duckdb-worker-process-{pid}-{suffix}-{counter}.csv"))
 }
 
 fn read_pid_file(path: &PathBuf) -> Option<u32> {
