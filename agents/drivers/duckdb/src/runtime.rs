@@ -27,7 +27,8 @@ impl DuckDbWorkerSession {
                 crate::schema::duckdb_attach_database(&locked, &attached.name, &path)?;
                 attached_names.push(attached.name.clone());
             }
-            if let Some(script) = params.init_script.as_deref() {
+            let combined_script = combine_init_script(params.init_script.as_deref(), &params.extra_attach_statements);
+            if let Some(script) = combined_script.as_deref() {
                 // Track script attachments by diffing the actual catalog list
                 // instead of parsing the SQL, so ATTACH without an alias,
                 // dynamic statements, and extension-specific syntax all count.
@@ -54,6 +55,7 @@ impl DuckDbWorkerSession {
             &locked,
             &self.attached_names,
             params.database.as_deref(),
+            params.schema.as_deref(),
             &params.sql,
             params.max_rows,
         )?;
@@ -212,6 +214,40 @@ fn duckdb_catalog_list(con: &duckdb::Connection) -> Result<Vec<String>, String> 
     let mut stmt = con.prepare("SHOW DATABASES").map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
     Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+/// Appends ad-hoc `extra_attach_statements` (replayed from a prior worker process's
+/// session, see `DuckDbWorkerClient::connect_params_with_ad_hoc_attach`) after the
+/// connection's `init_script`, so both run through the same tested statement-by-statement
+/// execution and catalog-diff tracking in `connect`. Returns `None` when there is nothing to run.
+///
+/// Because a replayed ATTACH now runs inside `connect` rather than being silently dropped on
+/// worker respawn, a catalog that becomes unreachable after first succeeding (e.g. expired S3
+/// credentials, a deleted remote file) will fail the *entire* `connect` on the next respawn,
+/// not just queries against that one catalog — trading a narrower failure mode (forgetting the
+/// attach) for a broader one (bricking the whole connection until it is edited/reconnected or
+/// the app restarts). Making replay best-effort (log-and-skip a failing statement) is a
+/// deliberate design decision left as a possible follow-up, not folded into this fix.
+fn combine_init_script(init_script: Option<&str>, extra_attach_statements: &[String]) -> Option<String> {
+    if extra_attach_statements.is_empty() {
+        return init_script.map(str::to_string);
+    }
+    let mut combined = String::new();
+    if let Some(script) = init_script {
+        let trimmed = script.trim_end().trim_end_matches(';').trim_end();
+        if !trimmed.is_empty() {
+            combined.push_str(trimmed);
+            combined.push(';');
+        }
+    }
+    for statement in extra_attach_statements {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(statement.trim_end().trim_end_matches(';'));
+        combined.push(';');
+    }
+    Some(combined)
 }
 
 #[derive(Clone, Default)]
@@ -479,6 +515,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
@@ -493,11 +530,17 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
         let result = session
-            .execute(DuckDbWorkerExecuteParams { sql: "SELECT 1 AS value".to_string(), database: None, max_rows: None })
+            .execute(DuckDbWorkerExecuteParams {
+                sql: "SELECT 1 AS value".to_string(),
+                database: None,
+                schema: None,
+                max_rows: None,
+            })
             .expect("execute");
 
         assert_eq!(result.columns, vec!["value"]);
@@ -512,6 +555,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
         session
@@ -521,6 +565,7 @@ mod tests {
                       CREATE TABLE analytics.items (id INTEGER)"
                     .to_string(),
                 database: None,
+                schema: None,
                 max_rows: None,
             })
             .expect("create table");
@@ -559,12 +604,14 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
         session
             .execute(DuckDbWorkerExecuteParams {
                 sql: "CREATE VIEW active_orders AS SELECT 1 AS id".to_string(),
                 database: None,
+                schema: None,
                 max_rows: None,
             })
             .expect("create view");
@@ -597,6 +644,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
@@ -636,6 +684,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: Some(script),
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
@@ -665,6 +714,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: Some(format!("ATTACH '{}';", attached_path.to_string_lossy().replace('\'', "''"))),
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
@@ -685,6 +735,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: Some("SELECT 1; SELECT * FROM missing_table;".to_string()),
+                extra_attach_statements: Vec::new(),
             })
             .expect_err("init script should fail");
         assert!(err.contains("statement 2"), "unexpected error: {err}");
@@ -705,6 +756,7 @@ mod tests {
                 path: ":memory:".to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             })
             .expect("connect");
 
@@ -712,6 +764,7 @@ mod tests {
             .execute(DuckDbWorkerExecuteParams {
                 sql: format!("ATTACH '{}' AS \"sales db\";", attached_path.to_string_lossy().replace('\'', "''")),
                 database: None,
+                schema: None,
                 max_rows: None,
             })
             .expect("attach sql");
@@ -721,6 +774,69 @@ mod tests {
             .list_tables(DuckDbWorkerTableParams { database: "sales db".to_string(), schema: "main".to_string() })
             .expect("list tables");
         assert!(tables.iter().any(|table| table.name == "orders"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worker_session_replays_extra_attach_statements_on_connect() {
+        let dir = std::env::temp_dir().join(format!("dbx-duckdb-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let attached_path = dir.join("gc.duckdb");
+        {
+            let con = duckdb::Connection::open(&attached_path).expect("create attached db");
+            con.execute_batch("CREATE TABLE events (id INTEGER);").expect("create attached table");
+        }
+        let mut session = DuckDbWorkerSession::default();
+        session
+            .connect(DuckDbWorkerConnectParams {
+                path: ":memory:".to_string(),
+                attached_databases: Vec::new(),
+                init_script: None,
+                extra_attach_statements: vec![format!(
+                    "ATTACH '{}' AS gc;",
+                    attached_path.to_string_lossy().replace('\'', "''")
+                )],
+            })
+            .expect("connect");
+
+        assert!(session.attached_names.iter().any(|name| name == "gc"), "names: {:?}", session.attached_names);
+        let tables = session
+            .list_tables(DuckDbWorkerTableParams { database: "gc".to_string(), schema: "main".to_string() })
+            .expect("list tables");
+        assert!(tables.iter().any(|table| table.name == "events"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worker_session_replays_extra_attach_statements_with_unterminated_init_script() {
+        let dir = std::env::temp_dir().join(format!("dbx-duckdb-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let attached_path = dir.join("gc.duckdb");
+        {
+            let con = duckdb::Connection::open(&attached_path).expect("create attached db");
+            con.execute_batch("CREATE TABLE events (id INTEGER);").expect("create attached table");
+        }
+        let mut session = DuckDbWorkerSession::default();
+        session
+            .connect(DuckDbWorkerConnectParams {
+                path: ":memory:".to_string(),
+                attached_databases: Vec::new(),
+                // Deliberately no trailing semicolon: config.init_script never guarantees one.
+                init_script: Some("SET memory_limit='512MB'".to_string()),
+                extra_attach_statements: vec![format!(
+                    "ATTACH '{}' AS gc;",
+                    attached_path.to_string_lossy().replace('\'', "''")
+                )],
+            })
+            .expect("connect should succeed even when init_script lacks a trailing semicolon");
+
+        assert!(session.attached_names.iter().any(|name| name == "gc"), "names: {:?}", session.attached_names);
+        let tables = session
+            .list_tables(DuckDbWorkerTableParams { database: "gc".to_string(), schema: "main".to_string() })
+            .expect("list tables");
+        assert!(tables.iter().any(|table| table.name == "events"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -14,6 +14,7 @@ use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::db;
+use crate::db::duckdb_sql::{attached_name_from_attach_sql, detached_name_from_detach_sql, split_sql_statements};
 use crate::db::duckdb_worker_protocol::{
     DuckDbWorkerColumnParams, DuckDbWorkerConnectParams, DuckDbWorkerError, DuckDbWorkerExecuteParams,
     DuckDbWorkerMethod, DuckDbWorkerObjectSourceParams, DuckDbWorkerRequest, DuckDbWorkerResponse,
@@ -56,9 +57,24 @@ struct DuckDbWorkerClientInner {
     executable: PathBuf,
     executable_args: Vec<OsString>,
     connect_params: DuckDbWorkerConnectParams,
+    /// Raw ad-hoc `ATTACH ...` statement text that succeeded via `execute_typed`, net of
+    /// any later `DETACH` for the same alias. Survives for the lifetime of this client
+    /// (i.e. the connection pool) and is replayed on every `Connect`, so a killed and
+    /// respawned worker process (idle metadata timeout, cancellation, poisoned-connection
+    /// recovery) keeps catalogs the LLM attached by typing plain SQL, not just ones
+    /// configured on the connection.
+    extra_attach_statements: Mutex<Vec<String>>,
     request_timeout: Duration,
     worker_start_timeout: Duration,
     next_id: AtomicU64,
+}
+
+/// A single ad-hoc `ATTACH`/`DETACH` effect parsed from one statement in an executed batch,
+/// kept in original statement order so `record_ad_hoc_attach_changes` can apply them as a
+/// single ordered pass instead of bucketing all removals before all additions.
+enum AdHocAttachChange {
+    Attach(String, String),
+    Detach(String),
 }
 
 #[derive(Default)]
@@ -183,7 +199,13 @@ impl DuckDbWorkerClient {
                 process_limit,
                 executable,
                 executable_args,
-                connect_params: DuckDbWorkerConnectParams { path, attached_databases, init_script },
+                connect_params: DuckDbWorkerConnectParams {
+                    path,
+                    attached_databases,
+                    init_script,
+                    extra_attach_statements: Vec::new(),
+                },
+                extra_attach_statements: Mutex::new(Vec::new()),
                 request_timeout,
                 worker_start_timeout,
                 next_id: AtomicU64::new(1),
@@ -194,17 +216,21 @@ impl DuckDbWorkerClient {
     pub async fn execute(
         &self,
         database: Option<String>,
+        schema: Option<String>,
         sql: String,
         max_rows: Option<usize>,
         cancel_token: Option<CancellationToken>,
         query_timeout: Option<Duration>,
     ) -> Result<db::QueryResult, String> {
-        self.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await.map_err(|error| error.message)
+        self.execute_typed(database, schema, sql, max_rows, cancel_token, query_timeout)
+            .await
+            .map_err(|error| error.message)
     }
 
     pub async fn execute_typed(
         &self,
         database: Option<String>,
+        schema: Option<String>,
         sql: String,
         max_rows: Option<usize>,
         cancel_token: Option<CancellationToken>,
@@ -225,15 +251,19 @@ impl DuckDbWorkerClient {
                 .ensure_connected()
                 .await
                 .map_err(|message| DuckDbWorkerError::new("duckdb_worker_connect_failed", message))?;
+            let sql_for_tracking = sql.clone();
             match client
                 .send_request_structured::<db::QueryResult>(
                     DuckDbWorkerMethod::Execute,
-                    DuckDbWorkerExecuteParams { sql, database, max_rows },
+                    DuckDbWorkerExecuteParams { sql, database, schema, max_rows },
                     None,
                 )
                 .await
             {
-                Ok(result) => Ok(result),
+                Ok(result) => {
+                    client.record_ad_hoc_attach_changes(&sql_for_tracking).await;
+                    Ok(result)
+                }
                 Err(error) => {
                     if error.code == DUCKDB_WORKER_POISONED_CODE {
                         client.kill().await;
@@ -471,10 +501,11 @@ impl DuckDbWorkerClient {
 
         let mut attempts = 0;
         loop {
+            let connect_params = self.connect_params_with_ad_hoc_attach().await;
             match self
                 .send_request_structured::<serde_json::Value>(
                     DuckDbWorkerMethod::Connect,
-                    self.inner.connect_params.clone(),
+                    connect_params,
                     Some(self.inner.request_timeout),
                 )
                 .await
@@ -505,6 +536,77 @@ impl DuckDbWorkerClient {
         let mut state = self.inner.state.lock().await;
         state.connected = true;
         Ok(())
+    }
+
+    /// Clones the pool's base connect params and overlays the ad-hoc `ATTACH` statements
+    /// tracked since this client was created, so a (re)spawned worker process replays them.
+    ///
+    /// Tradeoff: these statements now run inside `Connect` on the worker side (see
+    /// `combine_init_script` in `agents/drivers/duckdb/src/runtime.rs`), and a failed `Connect`
+    /// fails the whole reconnect. So a catalog that becomes unreachable after first succeeding
+    /// (expired credentials, a deleted remote file) will fail every query on the connection on
+    /// the next respawn, not just queries against that catalog — a broader failure mode than
+    /// the pre-fix behavior of silently forgetting the attach. Making replay best-effort is a
+    /// known possible follow-up, deliberately not included here.
+    async fn connect_params_with_ad_hoc_attach(&self) -> DuckDbWorkerConnectParams {
+        let mut params = self.inner.connect_params.clone();
+        let extra = self.inner.extra_attach_statements.lock().await;
+        params.extra_attach_statements = extra.clone();
+        params
+    }
+
+    /// Updates the tracked ad-hoc attach list from a SQL statement batch that just executed
+    /// successfully. Statements are applied in a single pass, in their original order, so a
+    /// batch like `"ATTACH ... AS gc; DETACH gc;"` nets out to "not tracked" (matching the net
+    /// effect of running the batch), rather than bucketing all additions and removals and
+    /// applying them out of order. Newly-attached aliases replace any earlier ad-hoc statement
+    /// for the same alias; detached aliases are removed. Aliases already covered by the
+    /// connection's configured `attached_databases` are left untracked here since
+    /// `connect_params` already replays those unconditionally.
+    async fn record_ad_hoc_attach_changes(&self, sql: &str) {
+        let mut changes = Vec::new();
+        for statement in split_sql_statements(sql) {
+            if let Some(name) = attached_name_from_attach_sql(&statement) {
+                changes.push(AdHocAttachChange::Attach(name, statement));
+                continue;
+            }
+            if let Some(name) = detached_name_from_detach_sql(&statement) {
+                changes.push(AdHocAttachChange::Detach(name));
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+
+        let mut extra = self.inner.extra_attach_statements.lock().await;
+        for change in changes {
+            match change {
+                AdHocAttachChange::Detach(name) => {
+                    extra.retain(|existing| {
+                        attached_name_from_attach_sql(existing)
+                            .map(|existing_name| !existing_name.eq_ignore_ascii_case(&name))
+                            .unwrap_or(true)
+                    });
+                }
+                AdHocAttachChange::Attach(name, statement) => {
+                    if self
+                        .inner
+                        .connect_params
+                        .attached_databases
+                        .iter()
+                        .any(|configured| configured.name.eq_ignore_ascii_case(&name))
+                    {
+                        continue;
+                    }
+                    extra.retain(|existing| {
+                        attached_name_from_attach_sql(existing)
+                            .map(|existing_name| !existing_name.eq_ignore_ascii_case(&name))
+                            .unwrap_or(true)
+                    });
+                    extra.push(statement);
+                }
+            }
+        }
     }
 
     async fn ensure_started_locked(&self, state: &mut WorkerProcessState) -> Result<(), String> {

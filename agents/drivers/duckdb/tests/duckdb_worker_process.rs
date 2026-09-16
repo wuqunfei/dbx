@@ -30,6 +30,7 @@ async fn worker_process_reads_view_source() {
     client
         .execute(
             None,
+            None,
             "CREATE VIEW active_orders AS SELECT 1 AS id".to_string(),
             None,
             None,
@@ -69,6 +70,7 @@ async fn worker_process_reads_table_ddl() {
     client
         .execute(
             None,
+            None,
             "CREATE TABLE orders(order_id BIGINT, amount DECIMAL(18, 2))".to_string(),
             None,
             None,
@@ -91,6 +93,62 @@ async fn worker_process_reads_table_ddl() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_applies_selected_schema_for_unqualified_queries() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let db_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&db_path);
+
+    let client =
+        DuckDbWorkerClient::open_with_executable(executable, db_path.to_string_lossy().to_string(), Vec::new(), None)
+            .await
+            .expect("worker process connects");
+
+    client
+        .execute(
+            None,
+            None,
+            "CREATE SCHEMA fin; CREATE TABLE fin.bar_1d (id INTEGER); INSERT INTO fin.bar_1d VALUES (1);".to_string(),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("create fin.bar_1d");
+
+    // Selecting schema "fin" should let an unqualified reference to bar_1d resolve, even
+    // though it does not exist in the default "main" schema this connection starts in.
+    let result = client
+        .execute(
+            None,
+            Some("fin".to_string()),
+            "SELECT * FROM bar_1d".to_string(),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("unqualified query should resolve against the selected schema");
+    assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
+
+    // A later query on the SAME shared connection with no schema selected must not inherit
+    // "fin" from the previous call. DuckDB connections are shared across every query tab
+    // targeting the same catalog, so schema has to be re-applied fresh on every execute()
+    // call rather than left as ambient session state one tab's selection could leak into
+    // another's query.
+    let unqualified_without_schema = client
+        .execute(None, None, "SELECT * FROM bar_1d".to_string(), Some(10), None, Some(Duration::from_secs(5)))
+        .await;
+    assert!(
+        unqualified_without_schema.is_err(),
+        "bar_1d should not resolve against schema main once no schema is selected"
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_process_recovers_immediately_after_cancelled_long_query() {
     let _guard = duckdb_worker_process_test_guard().await;
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
@@ -104,6 +162,7 @@ async fn worker_process_recovers_immediately_after_cancelled_long_query() {
 
     let token = CancellationToken::new();
     let long_query = client.execute(
+        None,
         None,
         "SELECT sum(sin(i::DOUBLE) * cos(i::DOUBLE / 3.0)) FROM range(100000000000) AS t(i)".to_string(),
         Some(10),
@@ -123,6 +182,7 @@ async fn worker_process_recovers_immediately_after_cancelled_long_query() {
     let probe = tokio::time::timeout(
         Duration::from_secs(5),
         client.execute(
+            None,
             None,
             "SELECT 1 AS after_cancel_probe".to_string(),
             Some(10),
@@ -167,6 +227,7 @@ async fn worker_process_recovers_after_registered_cancel_interrupt() {
 
     let long_query = client.execute(
         None,
+        None,
         "SELECT sum(sin(i::DOUBLE) * cos(i::DOUBLE / 3.0)) FROM range(100000000000) AS t(i)".to_string(),
         Some(10),
         Some(registered.token()),
@@ -186,6 +247,7 @@ async fn worker_process_recovers_after_registered_cancel_interrupt() {
     let probe = tokio::time::timeout(
         Duration::from_secs(5),
         client.execute(
+            None,
             None,
             "SELECT 1 AS after_cancel_probe".to_string(),
             Some(10),
@@ -219,6 +281,7 @@ async fn worker_process_recovers_after_parser_error() {
     client
         .execute(
             None,
+            None,
             "CREATE TABLE events (id INTEGER, name VARCHAR); INSERT INTO events VALUES (1, 'login');".to_string(),
             Some(10),
             None,
@@ -228,14 +291,14 @@ async fn worker_process_recovers_after_parser_error() {
         .expect("create events table");
 
     let typed_err = client
-        .execute_typed(None, "select * from table limit 19;".to_string(), Some(10), None, Some(Duration::from_secs(5)))
+        .execute_typed(None, None, "select * from table limit 19;".to_string(), Some(10), None, Some(Duration::from_secs(5)))
         .await
         .expect_err("reserved word query should fail");
     assert_eq!(typed_err.code, "duckdb_execute_failed");
     assert!(typed_err.message.contains("Parser Error"), "unexpected error: {}", typed_err.message);
 
     let err = client
-        .execute(None, "select * from table limit 19;".to_string(), Some(10), None, Some(Duration::from_secs(5)))
+        .execute(None, None, "select * from table limit 19;".to_string(), Some(10), None, Some(Duration::from_secs(5)))
         .await
         .expect_err("reserved word query should fail");
     assert!(err.contains("Parser Error"), "unexpected error: {err}");
@@ -243,6 +306,7 @@ async fn worker_process_recovers_after_parser_error() {
     let probe = tokio::time::timeout(
         Duration::from_secs(5),
         client.execute(
+            None,
             None,
             "SELECT * FROM events LIMIT 100;".to_string(),
             Some(100),
@@ -278,6 +342,7 @@ async fn worker_process_keeps_session_state_after_benign_error() {
     client
         .execute(
             None,
+            None,
             "CREATE TEMP TABLE scratch (id INTEGER); INSERT INTO scratch VALUES (7);".to_string(),
             Some(10),
             None,
@@ -289,14 +354,14 @@ async fn worker_process_keeps_session_state_after_benign_error() {
     // Catalog error: prepare succeeds, the query fails at bind/exec time. This does not
     // poison the connection, so the worker must stay alive and keep the temp table.
     let err = client
-        .execute(None, "SELECT * FROM does_not_exist;".to_string(), Some(10), None, Some(Duration::from_secs(5)))
+        .execute(None, None, "SELECT * FROM does_not_exist;".to_string(), Some(10), None, Some(Duration::from_secs(5)))
         .await
         .expect_err("missing table query should fail");
     assert!(err.contains("does_not_exist") || err.contains("Catalog Error"), "unexpected error: {err}");
 
     let probe = tokio::time::timeout(
         Duration::from_secs(5),
-        client.execute(None, "SELECT id FROM scratch;".to_string(), Some(10), None, Some(Duration::from_secs(5))),
+        client.execute(None, None, "SELECT id FROM scratch;".to_string(), Some(10), None, Some(Duration::from_secs(5))),
     )
     .await
     .expect("query after benign error should not hang")
@@ -307,6 +372,220 @@ async fn worker_process_keeps_session_state_after_benign_error() {
 
     client.shutdown().await;
     let _ = std::fs::remove_file(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_replays_ad_hoc_attach_after_respawn() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let db_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&db_path);
+    let attached_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&attached_path);
+    let csv_path = temp_csv_path();
+    std::fs::write(&csv_path, "id,name\n7,Ada\n8,Grace\n").expect("write events csv");
+    {
+        // Populate the attached catalog from a real CSV file so this test exercises
+        // externally-sourced data behind an attached catalog, the same shape as the
+        // reported bug's Iceberg/S3 Tables catalog (kept network-free here).
+        let con = duckdb::Connection::open(&attached_path).expect("create attached db");
+        con.execute_batch(&format!(
+            "CREATE TABLE events AS SELECT * FROM read_csv_auto('{}');",
+            csv_path.to_string_lossy().replace('\'', "''")
+        ))
+        .expect("create attached table from csv");
+    }
+
+    let client =
+        DuckDbWorkerClient::open_with_executable(executable, db_path.to_string_lossy().to_string(), Vec::new(), None)
+            .await
+            .expect("worker process connects");
+
+    client
+        .execute(
+            None,
+            None,
+            format!("ATTACH '{}' AS gc;", attached_path.to_string_lossy().replace('\'', "''")),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("ad-hoc attach");
+
+    // Simulate the worker process dying and respawning between the ATTACH and the next
+    // query that targets it (e.g. the 60s metadata-request timeout firing while an LLM
+    // lists the newly-attached catalog's schemas before querying it).
+    client.kill().await;
+
+    let result = client
+        .execute(
+            Some("gc".to_string()),
+            None,
+            "SELECT id, name FROM events ORDER BY id".to_string(),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("query against ad-hoc attached catalog should survive a worker respawn");
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![serde_json::json!(7), serde_json::json!("Ada")],
+            vec![serde_json::json!(8), serde_json::json!("Grace")],
+        ]
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&attached_path);
+    let _ = std::fs::remove_file(&csv_path);
+}
+
+/// Opt-in reproduction against a real S3-hosted catalog, matching the exact scenario from
+/// the original bug report (an Iceberg/S3 Tables catalog attached via `httpfs`/`aws`). Set
+/// `DBX_TEST_S3_DUCKDB_ATTACH_URL` to a DuckDB file URL you have read access to (e.g.
+/// `s3://your-bucket/file.duckdb`, with credentials available via the default AWS credential
+/// chain — see `~/.aws` or `AWS_*` env vars) to run this for real. Skipped by default so the
+/// rest of this suite stays network-free and does not depend on any account's credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_replays_ad_hoc_s3_attach_after_respawn() {
+    let Ok(url) = std::env::var("DBX_TEST_S3_DUCKDB_ATTACH_URL") else {
+        eprintln!(
+            "skipping worker_process_replays_ad_hoc_s3_attach_after_respawn: set DBX_TEST_S3_DUCKDB_ATTACH_URL to run"
+        );
+        return;
+    };
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let db_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&db_path);
+
+    let client =
+        DuckDbWorkerClient::open_with_executable(executable, db_path.to_string_lossy().to_string(), Vec::new(), None)
+            .await
+            .expect("worker process connects");
+
+    client
+        .execute(None, None, "INSTALL httpfs; LOAD httpfs;".to_string(), Some(10), None, Some(Duration::from_secs(30)))
+        .await
+        .expect("load httpfs");
+    client
+        .execute(
+            None,
+            None,
+            format!("ATTACH '{}' AS gc (READ_ONLY);", url.replace('\'', "''")),
+            Some(10),
+            None,
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .expect("ad-hoc S3 attach");
+
+    // Simulate the worker process dying and respawning between the ATTACH and the next
+    // query, exactly as in the original report.
+    client.kill().await;
+
+    let result = client
+        .execute(Some("gc".to_string()), None, "SHOW TABLES".to_string(), Some(10), None, Some(Duration::from_secs(30)))
+        .await
+        .expect("query against the S3-attached catalog should survive a worker respawn");
+    assert!(!result.columns.is_empty());
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_does_not_replay_detached_ad_hoc_attach_after_respawn() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let db_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&db_path);
+    let attached_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&attached_path);
+    {
+        let con = duckdb::Connection::open(&attached_path).expect("create attached db");
+        con.execute_batch("CREATE TABLE events (id INTEGER);").expect("create attached table");
+    }
+
+    let client =
+        DuckDbWorkerClient::open_with_executable(executable, db_path.to_string_lossy().to_string(), Vec::new(), None)
+            .await
+            .expect("worker process connects");
+
+    client
+        .execute(
+            None,
+            None,
+            format!("ATTACH '{}' AS gc;", attached_path.to_string_lossy().replace('\'', "''")),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("ad-hoc attach");
+    client.execute(None, None, "DETACH gc;".to_string(), Some(10), None, Some(Duration::from_secs(5))).await.expect("detach");
+
+    client.kill().await;
+
+    let databases = client.list_databases().await.expect("list databases after respawn");
+    assert!(
+        !databases.iter().any(|database| database.name == "gc"),
+        "detached catalog should not be replayed after respawn: {databases:?}"
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&attached_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_does_not_replay_ad_hoc_attach_detached_in_same_batch_after_respawn() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let db_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&db_path);
+    let attached_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&attached_path);
+    {
+        let con = duckdb::Connection::open(&attached_path).expect("create attached db");
+        con.execute_batch("CREATE TABLE events (id INTEGER);").expect("create attached table");
+    }
+
+    let client =
+        DuckDbWorkerClient::open_with_executable(executable, db_path.to_string_lossy().to_string(), Vec::new(), None)
+            .await
+            .expect("worker process connects");
+
+    // ATTACH and DETACH in a single execute() batch. Net effect should be "not tracked",
+    // proving record_ad_hoc_attach_changes applies statements in original order within a
+    // batch rather than bucketing all removals before all additions.
+    client
+        .execute(
+            None,
+            None,
+            format!("ATTACH '{}' AS gc; DETACH gc;", attached_path.to_string_lossy().replace('\'', "''")),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("ad-hoc attach then detach in one batch");
+
+    client.kill().await;
+
+    let databases = client.list_databases().await.expect("list databases after respawn");
+    assert!(
+        !databases.iter().any(|database| database.name == "gc"),
+        "catalog attached then detached in the same batch should not be replayed after respawn: {databases:?}"
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&attached_path);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -334,6 +613,7 @@ async fn worker_process_exits_when_stdin_closes_during_active_query() {
                 path: db_path.to_string_lossy().to_string(),
                 attached_databases: Vec::new(),
                 init_script: None,
+                extra_attach_statements: Vec::new(),
             },
         )
         .expect("connect request"),
@@ -350,6 +630,7 @@ async fn worker_process_exits_when_stdin_closes_during_active_query() {
             DuckDbWorkerExecuteParams {
                 sql: "SELECT sum(sin(i::DOUBLE) * cos(i::DOUBLE / 3.0)) FROM range(100000000000) AS t(i)".to_string(),
                 database: None,
+                schema: None,
                 max_rows: Some(10),
             },
         )
@@ -389,7 +670,7 @@ async fn worker_process_is_killed_after_connect_timeout() {
     );
 
     let err = client
-        .execute(None, "SELECT 1".to_string(), Some(10), None, Some(Duration::from_secs(5)))
+        .execute(None, None, "SELECT 1".to_string(), Some(10), None, Some(Duration::from_secs(5)))
         .await
         .expect_err("connect should time out");
     std::env::remove_var("DBX_DUCKDB_HANGING_CONNECT_PID_FILE");
@@ -425,7 +706,7 @@ async fn worker_process_is_killed_after_connect_error() {
     );
 
     let err = client
-        .execute(None, "SELECT 1".to_string(), Some(10), None, Some(Duration::from_secs(5)))
+        .execute(None, None, "SELECT 1".to_string(), Some(10), None, Some(Duration::from_secs(5)))
         .await
         .expect_err("connect should fail with an invalid DuckDB path");
     std::env::remove_var("DBX_DUCKDB_PID_TEST_HOST_PID_FILE");
@@ -481,7 +762,7 @@ async fn worker_process_retries_connect_after_transient_file_lock() {
     );
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        client.execute(None, "SELECT 42 AS retried".to_string(), Some(10), None, Some(Duration::from_secs(5))),
+        client.execute(None, None, "SELECT 42 AS retried".to_string(), Some(10), None, Some(Duration::from_secs(5))),
     )
     .await;
 
@@ -515,6 +796,7 @@ async fn worker_shutdown_checkpoints_and_removes_wal() {
     client
         .execute(
             None,
+            None,
             "CREATE TABLE events (id INTEGER); INSERT INTO events VALUES (7);".to_string(),
             Some(10),
             None,
@@ -536,7 +818,7 @@ async fn worker_shutdown_checkpoints_and_removes_wal() {
             .await
             .expect("reopen after shutdown");
     let result = client
-        .execute(None, "SELECT id FROM events".to_string(), Some(10), None, Some(Duration::from_secs(5)))
+        .execute(None, None, "SELECT id FROM events".to_string(), Some(10), None, Some(Duration::from_secs(5)))
         .await
         .expect("read events back");
     assert_eq!(result.rows, vec![vec![serde_json::json!(7)]]);
@@ -586,6 +868,13 @@ fn temp_pid_path() -> PathBuf {
     let pid = std::process::id();
     let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("dbx-duckdb-worker-process-{pid}-{suffix}-{counter}.pid"))
+}
+
+fn temp_csv_path() -> PathBuf {
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let pid = std::process::id();
+    let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("dbx-duckdb-worker-process-{pid}-{suffix}-{counter}.csv"))
 }
 
 fn read_pid_file(path: &PathBuf) -> Option<u32> {
