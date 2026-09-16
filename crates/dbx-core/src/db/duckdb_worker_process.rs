@@ -69,6 +69,14 @@ struct DuckDbWorkerClientInner {
     next_id: AtomicU64,
 }
 
+/// A single ad-hoc `ATTACH`/`DETACH` effect parsed from one statement in an executed batch,
+/// kept in original statement order so `record_ad_hoc_attach_changes` can apply them as a
+/// single ordered pass instead of bucketing all removals before all additions.
+enum AdHocAttachChange {
+    Attach(String, String),
+    Detach(String),
+}
+
 #[derive(Default)]
 struct WorkerProcessState {
     child: Option<Child>,
@@ -528,6 +536,14 @@ impl DuckDbWorkerClient {
 
     /// Clones the pool's base connect params and overlays the ad-hoc `ATTACH` statements
     /// tracked since this client was created, so a (re)spawned worker process replays them.
+    ///
+    /// Tradeoff: these statements now run inside `Connect` on the worker side (see
+    /// `combine_init_script` in `agents/drivers/duckdb/src/runtime.rs`), and a failed `Connect`
+    /// fails the whole reconnect. So a catalog that becomes unreachable after first succeeding
+    /// (expired credentials, a deleted remote file) will fail every query on the connection on
+    /// the next respawn, not just queries against that catalog — a broader failure mode than
+    /// the pre-fix behavior of silently forgetting the attach. Making replay best-effort is a
+    /// known possible follow-up, deliberately not included here.
     async fn connect_params_with_ad_hoc_attach(&self) -> DuckDbWorkerConnectParams {
         let mut params = self.inner.connect_params.clone();
         let extra = self.inner.extra_attach_statements.lock().await;
@@ -535,46 +551,57 @@ impl DuckDbWorkerClient {
         params
     }
 
-    /// Updates the tracked ad-hoc attach list from a SQL statement that just executed
-    /// successfully: newly-attached aliases are added (replacing any earlier ad-hoc
-    /// statement for the same alias), and detached aliases are removed. Aliases already
-    /// covered by the connection's configured `attached_databases` are left untracked here
-    /// since `connect_params` already replays those unconditionally.
+    /// Updates the tracked ad-hoc attach list from a SQL statement batch that just executed
+    /// successfully. Statements are applied in a single pass, in their original order, so a
+    /// batch like `"ATTACH ... AS gc; DETACH gc;"` nets out to "not tracked" (matching the net
+    /// effect of running the batch), rather than bucketing all additions and removals and
+    /// applying them out of order. Newly-attached aliases replace any earlier ad-hoc statement
+    /// for the same alias; detached aliases are removed. Aliases already covered by the
+    /// connection's configured `attached_databases` are left untracked here since
+    /// `connect_params` already replays those unconditionally.
     async fn record_ad_hoc_attach_changes(&self, sql: &str) {
-        let mut additions = Vec::new();
-        let mut removals = Vec::new();
+        let mut changes = Vec::new();
         for statement in split_sql_statements(sql) {
             if let Some(name) = attached_name_from_attach_sql(&statement) {
-                additions.push((name, statement));
+                changes.push(AdHocAttachChange::Attach(name, statement));
                 continue;
             }
             if let Some(name) = detached_name_from_detach_sql(&statement) {
-                removals.push(name);
+                changes.push(AdHocAttachChange::Detach(name));
             }
         }
-        if additions.is_empty() && removals.is_empty() {
+        if changes.is_empty() {
             return;
         }
 
         let mut extra = self.inner.extra_attach_statements.lock().await;
-        for name in &removals {
-            extra.retain(|existing| {
-                attached_name_from_attach_sql(existing)
-                    .map(|existing_name| !existing_name.eq_ignore_ascii_case(name))
-                    .unwrap_or(true)
-            });
-        }
-        for (name, statement) in additions {
-            if self.inner.connect_params.attached_databases.iter().any(|configured| configured.name.eq_ignore_ascii_case(&name))
-            {
-                continue;
+        for change in changes {
+            match change {
+                AdHocAttachChange::Detach(name) => {
+                    extra.retain(|existing| {
+                        attached_name_from_attach_sql(existing)
+                            .map(|existing_name| !existing_name.eq_ignore_ascii_case(&name))
+                            .unwrap_or(true)
+                    });
+                }
+                AdHocAttachChange::Attach(name, statement) => {
+                    if self
+                        .inner
+                        .connect_params
+                        .attached_databases
+                        .iter()
+                        .any(|configured| configured.name.eq_ignore_ascii_case(&name))
+                    {
+                        continue;
+                    }
+                    extra.retain(|existing| {
+                        attached_name_from_attach_sql(existing)
+                            .map(|existing_name| !existing_name.eq_ignore_ascii_case(&name))
+                            .unwrap_or(true)
+                    });
+                    extra.push(statement);
+                }
             }
-            extra.retain(|existing| {
-                attached_name_from_attach_sql(existing)
-                    .map(|existing_name| !existing_name.eq_ignore_ascii_case(&name))
-                    .unwrap_or(true)
-            });
-            extra.push(statement);
         }
     }
 

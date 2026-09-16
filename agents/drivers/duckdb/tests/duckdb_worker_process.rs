@@ -474,6 +474,51 @@ async fn worker_process_does_not_replay_detached_ad_hoc_attach_after_respawn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_does_not_replay_ad_hoc_attach_detached_in_same_batch_after_respawn() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let db_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&db_path);
+    let attached_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&attached_path);
+    {
+        let con = duckdb::Connection::open(&attached_path).expect("create attached db");
+        con.execute_batch("CREATE TABLE events (id INTEGER);").expect("create attached table");
+    }
+
+    let client =
+        DuckDbWorkerClient::open_with_executable(executable, db_path.to_string_lossy().to_string(), Vec::new(), None)
+            .await
+            .expect("worker process connects");
+
+    // ATTACH and DETACH in a single execute() batch. Net effect should be "not tracked",
+    // proving record_ad_hoc_attach_changes applies statements in original order within a
+    // batch rather than bucketing all removals before all additions.
+    client
+        .execute(
+            None,
+            format!("ATTACH '{}' AS gc; DETACH gc;", attached_path.to_string_lossy().replace('\'', "''")),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("ad-hoc attach then detach in one batch");
+
+    client.kill().await;
+
+    let databases = client.list_databases().await.expect("list databases after respawn");
+    assert!(
+        !databases.iter().any(|database| database.name == "gc"),
+        "catalog attached then detached in the same batch should not be replayed after respawn: {databases:?}"
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&attached_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_process_exits_when_stdin_closes_during_active_query() {
     let _guard = duckdb_worker_process_test_guard().await;
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
