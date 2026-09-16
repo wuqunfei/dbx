@@ -27,7 +27,8 @@ impl DuckDbWorkerSession {
                 crate::schema::duckdb_attach_database(&locked, &attached.name, &path)?;
                 attached_names.push(attached.name.clone());
             }
-            if let Some(script) = params.init_script.as_deref() {
+            let combined_script = combine_init_script(params.init_script.as_deref(), &params.extra_attach_statements);
+            if let Some(script) = combined_script.as_deref() {
                 // Track script attachments by diffing the actual catalog list
                 // instead of parsing the SQL, so ATTACH without an alias,
                 // dynamic statements, and extension-specific syntax all count.
@@ -212,6 +213,25 @@ fn duckdb_catalog_list(con: &duckdb::Connection) -> Result<Vec<String>, String> 
     let mut stmt = con.prepare("SHOW DATABASES").map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
     Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+/// Appends ad-hoc `extra_attach_statements` (replayed from a prior worker process's
+/// session, see `DuckDbWorkerClient::connect_params_with_ad_hoc_attach`) after the
+/// connection's `init_script`, so both run through the same tested statement-by-statement
+/// execution and catalog-diff tracking in `connect`. Returns `None` when there is nothing to run.
+fn combine_init_script(init_script: Option<&str>, extra_attach_statements: &[String]) -> Option<String> {
+    if extra_attach_statements.is_empty() {
+        return init_script.map(str::to_string);
+    }
+    let mut combined = init_script.map(str::to_string).unwrap_or_default();
+    for statement in extra_attach_statements {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(statement.trim_end().trim_end_matches(';'));
+        combined.push(';');
+    }
+    Some(combined)
 }
 
 #[derive(Clone, Default)]
@@ -730,6 +750,37 @@ mod tests {
             .list_tables(DuckDbWorkerTableParams { database: "sales db".to_string(), schema: "main".to_string() })
             .expect("list tables");
         assert!(tables.iter().any(|table| table.name == "orders"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worker_session_replays_extra_attach_statements_on_connect() {
+        let dir = std::env::temp_dir().join(format!("dbx-duckdb-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let attached_path = dir.join("gc.duckdb");
+        {
+            let con = duckdb::Connection::open(&attached_path).expect("create attached db");
+            con.execute_batch("CREATE TABLE events (id INTEGER);").expect("create attached table");
+        }
+        let mut session = DuckDbWorkerSession::default();
+        session
+            .connect(DuckDbWorkerConnectParams {
+                path: ":memory:".to_string(),
+                attached_databases: Vec::new(),
+                init_script: None,
+                extra_attach_statements: vec![format!(
+                    "ATTACH '{}' AS gc;",
+                    attached_path.to_string_lossy().replace('\'', "''")
+                )],
+            })
+            .expect("connect");
+
+        assert!(session.attached_names.iter().any(|name| name == "gc"), "names: {:?}", session.attached_names);
+        let tables = session
+            .list_tables(DuckDbWorkerTableParams { database: "gc".to_string(), schema: "main".to_string() })
+            .expect("list tables");
+        assert!(tables.iter().any(|table| table.name == "events"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
