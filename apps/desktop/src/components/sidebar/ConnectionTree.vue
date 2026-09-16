@@ -84,6 +84,8 @@ import type { SidebarDangerDialogOption, SidebarDangerDialogRequest } from "@/li
 import { resetSidebarTreeDialogState, sidebarDangerRunningExecutionId } from "./sidebarTreeDialogState";
 import { SidebarDangerConfirmDialog, SidebarDdlViewDialog, SidebarElasticsearchIndexMetadataDialog, SidebarObjectSourceDialog, SidebarProcedureExecutionDialog, SidebarVisibleDatabasesDialog, SidebarVisibleNacosNamespacesDialog, SidebarVisibleSchemasDialog } from "./sidebarAsyncDialogs";
 import { sortConnectionListForDisplay } from "@/lib/sidebar/connectionListSort";
+import { filterTreeNodesByConnectionType } from "@/lib/sidebar/connectionTypeFilter";
+import type { DatabaseType } from "@/types/generated/databaseTypes";
 import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { alignedSidebarCommentLabelWidths, isSidebarCommentAlignableNode, sidebarTreeNaturalContentWidth, sidebarTreeNodeComment, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
 import { formatSidebarObjectStorage, sidebarTableStorageScopes, supportsSidebarTableStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
@@ -91,6 +93,10 @@ import { sidebarScrollbarGeometry as calculateSidebarScrollbarGeometry } from "@
 import { createSidebarLayoutMonitor, type SidebarExpandedConnectionInfo } from "@/lib/sidebar/sidebarLayoutMonitor";
 import { disconnectSidebarConnections } from "@/lib/sidebar/sidebarConnectionDisconnect";
 import { compileSearchRegex } from "@/lib/common/searchPattern";
+
+const props = defineProps<{
+  connectionTypeFilter?: DatabaseType[];
+}>();
 
 const { t } = useI18n();
 const store = useConnectionStore();
@@ -651,7 +657,10 @@ function restoreTableSearchInput(focusRestore: TableSearchFocusRestore) {
   });
 }
 
-const displayedTreeNodes = computed(() => sortConnectionListForDisplay(store.treeNodes, settingsStore.editorSettings.sidebarConnectionSortMode));
+const displayedTreeNodes = computed(() => {
+  const baseNodes = props.connectionTypeFilter?.length ? filterTreeNodesByConnectionType(store.treeNodes, props.connectionTypeFilter, (id) => store.getConfig(id)?.db_type as DatabaseType | undefined) : store.treeNodes;
+  return sortConnectionListForDisplay(baseNodes, settingsStore.editorSettings.sidebarConnectionSortMode);
+});
 const localTableSearchResults = ref<Record<string, TableInfo[] | null>>({});
 const localTableSearchRequestRevisions = new Map<string, number>();
 type InvalidatedTableSearchScope = SidebarRegexScopeIdentity & { parentNodeId: string };
