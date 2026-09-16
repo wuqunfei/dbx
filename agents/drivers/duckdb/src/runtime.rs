@@ -219,11 +219,26 @@ fn duckdb_catalog_list(con: &duckdb::Connection) -> Result<Vec<String>, String> 
 /// session, see `DuckDbWorkerClient::connect_params_with_ad_hoc_attach`) after the
 /// connection's `init_script`, so both run through the same tested statement-by-statement
 /// execution and catalog-diff tracking in `connect`. Returns `None` when there is nothing to run.
+///
+/// Because a replayed ATTACH now runs inside `connect` rather than being silently dropped on
+/// worker respawn, a catalog that becomes unreachable after first succeeding (e.g. expired S3
+/// credentials, a deleted remote file) will fail the *entire* `connect` on the next respawn,
+/// not just queries against that one catalog — trading a narrower failure mode (forgetting the
+/// attach) for a broader one (bricking the whole connection until it is edited/reconnected or
+/// the app restarts). Making replay best-effort (log-and-skip a failing statement) is a
+/// deliberate design decision left as a possible follow-up, not folded into this fix.
 fn combine_init_script(init_script: Option<&str>, extra_attach_statements: &[String]) -> Option<String> {
     if extra_attach_statements.is_empty() {
         return init_script.map(str::to_string);
     }
-    let mut combined = init_script.map(str::to_string).unwrap_or_default();
+    let mut combined = String::new();
+    if let Some(script) = init_script {
+        let trimmed = script.trim_end().trim_end_matches(';').trim_end();
+        if !trimmed.is_empty() {
+            combined.push_str(trimmed);
+            combined.push(';');
+        }
+    }
     for statement in extra_attach_statements {
         if !combined.is_empty() {
             combined.push('\n');
@@ -775,6 +790,38 @@ mod tests {
                 )],
             })
             .expect("connect");
+
+        assert!(session.attached_names.iter().any(|name| name == "gc"), "names: {:?}", session.attached_names);
+        let tables = session
+            .list_tables(DuckDbWorkerTableParams { database: "gc".to_string(), schema: "main".to_string() })
+            .expect("list tables");
+        assert!(tables.iter().any(|table| table.name == "events"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn worker_session_replays_extra_attach_statements_with_unterminated_init_script() {
+        let dir = std::env::temp_dir().join(format!("dbx-duckdb-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let attached_path = dir.join("gc.duckdb");
+        {
+            let con = duckdb::Connection::open(&attached_path).expect("create attached db");
+            con.execute_batch("CREATE TABLE events (id INTEGER);").expect("create attached table");
+        }
+        let mut session = DuckDbWorkerSession::default();
+        session
+            .connect(DuckDbWorkerConnectParams {
+                path: ":memory:".to_string(),
+                attached_databases: Vec::new(),
+                // Deliberately no trailing semicolon: config.init_script never guarantees one.
+                init_script: Some("SET memory_limit='512MB'".to_string()),
+                extra_attach_statements: vec![format!(
+                    "ATTACH '{}' AS gc;",
+                    attached_path.to_string_lossy().replace('\'', "''")
+                )],
+            })
+            .expect("connect should succeed even when init_script lacks a trailing semicolon");
 
         assert!(session.attached_names.iter().any(|name| name == "gc"), "names: {:?}", session.attached_names);
         let tables = session
