@@ -274,6 +274,7 @@ const props = defineProps<{
   prefillConfig?: ConnectionDeepLinkDraft | null;
   pluginProvider?: PluginCenterFocus | null;
   initialTab?: ConfigTab;
+  restrictToDbTypes?: readonly DatabaseType[];
 }>();
 
 const emit = defineEmits<{
@@ -3041,11 +3042,14 @@ assertCompleteDatabaseCategories(
 const hiddenPickerOptionTypes = new Set(Object.keys(MERGED_PICKER_OPTION_FOR_TYPE));
 
 const dbCategories = computed<DbCategory[]>(() => {
-  const categories: DbCategory[] = dbCategoryDefinitions.map((category) => ({
-    key: category.key,
-    title: t(category.titleKey),
-    options: dbOptions.filter((option) => category.optionValues.includes(option.value) && !hiddenPickerOptionTypes.has(option.value)),
-  }));
+  const categories: DbCategory[] = dbCategoryDefinitions
+    .map((category) => ({
+      key: category.key,
+      title: t(category.titleKey),
+      options: dbOptions.filter((option) => category.optionValues.includes(option.value) && !hiddenPickerOptionTypes.has(option.value) && (!props.restrictToDbTypes || props.restrictToDbTypes.includes(option.value as DatabaseType))),
+    }))
+    .filter((category) => category.options.length > 0);
+  if (props.restrictToDbTypes) return categories;
   const pluginOptions: DbOption[] = pluginConnectionProviders.value.map((entry) => ({
     value: pluginConnectionProviderOptionValue(entry.plugin.manifest.id, entry.contribution.id),
     label: entry.contribution.label,

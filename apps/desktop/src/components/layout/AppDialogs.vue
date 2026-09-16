@@ -39,6 +39,7 @@ const props = defineProps<{
   connectionPrefill?: ConnectionDeepLinkDraft | null;
   connectionPluginProvider?: PluginCenterFocus | null;
   connectionInitialTab?: ConfigTab;
+  connectionRestrictToDbTypes?: readonly DatabaseType[];
   showDangerDialog: boolean;
   dangerSql: string;
   suppressDangerConfirm: boolean;
@@ -172,6 +173,7 @@ watch(
     :prefill-config="connectionPrefill"
     :plugin-provider="connectionPluginProvider"
     :initial-tab="connectionInitialTab"
+    :restrict-to-db-types="connectionRestrictToDbTypes"
     @update:open="emit('update:showConnectionDialog', $event)"
     @connect-started="emit('connectStarted', $event)"
     @connect-succeeded="emit('connectSucceeded', $event)"
