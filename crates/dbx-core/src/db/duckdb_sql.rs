@@ -162,6 +162,33 @@ pub fn config_attached_names(config: &ConnectionConfig) -> Vec<String> {
     names
 }
 
+/// Returns the name of a `DETACH [DATABASE] [IF EXISTS] <name>` statement, or `None`
+/// when the statement is not a DETACH. Reuses `parse_identifier_after_as`'s comment/quote
+/// handling for the trailing identifier, since both grammars end in a bare-or-quoted name.
+pub fn detached_name_from_detach_sql(sql: &str) -> Option<String> {
+    let trimmed = strip_leading_comments(sql);
+    let (first_word, rest) = split_first_word(trimmed);
+    if !first_word.eq_ignore_ascii_case("DETACH") {
+        return None;
+    }
+    let (second_word, after_second) = split_first_word(rest);
+    let rest = if second_word.eq_ignore_ascii_case("DATABASE") { after_second } else { rest };
+    let (third_word, after_third) = split_first_word(rest);
+    let rest = if third_word.eq_ignore_ascii_case("IF") {
+        let (fourth_word, after_fourth) = split_first_word(after_third);
+        if fourth_word.eq_ignore_ascii_case("EXISTS") { after_fourth } else { rest }
+    } else {
+        rest
+    };
+    parse_identifier_after_as(rest)
+}
+
+fn split_first_word(sql: &str) -> (&str, &str) {
+    let sql = sql.trim_start();
+    let end = sql.find(|ch: char| ch.is_whitespace() || ch == ';').unwrap_or(sql.len());
+    (&sql[..end], &sql[end..])
+}
+
 fn find_as_keyword_outside_quotes(sql: &str) -> Option<usize> {
     let bytes = sql.as_bytes();
     let mut i = 0;
@@ -289,5 +316,17 @@ mod tests {
     fn init_script_names_collects_attach_aliases() {
         let script = "INSTALL httpfs; LOAD httpfs;\nCREATE SECRET (TYPE s3, KEY_ID 'k', SECRET 's');\nATTACH 'ducklake:postgres:dbname=lake' AS lake;\nATTACH 'sales.duckdb' AS \"sales db\";";
         assert_eq!(init_script_attached_names(script), vec!["lake".to_string(), "sales db".to_string()]);
+    }
+
+    #[test]
+    fn detects_detach_name_variants() {
+        assert_eq!(detached_name_from_detach_sql("DETACH gc;"), Some("gc".to_string()));
+        assert_eq!(detached_name_from_detach_sql("DETACH DATABASE gc;"), Some("gc".to_string()));
+        assert_eq!(
+            detached_name_from_detach_sql("DETACH DATABASE IF EXISTS \"sales db\";"),
+            Some("sales db".to_string())
+        );
+        assert_eq!(detached_name_from_detach_sql("-- note\nDETACH gc"), Some("gc".to_string()));
+        assert_eq!(detached_name_from_detach_sql("SELECT 1"), None);
     }
 }

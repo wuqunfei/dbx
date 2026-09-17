@@ -14,10 +14,12 @@ import { connectionGroupDestinationRows } from "@/lib/sidebar/sidebarLayout";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
 import type { QueryTab, TreeNode } from "@/types/database";
+import type { DatabaseType } from "@/types/generated/databaseTypes";
 
 defineProps<{
   sidebarWidth: number;
   classicLayout?: boolean;
+  connectionTypeFilter?: DatabaseType[];
 }>();
 
 const emit = defineEmits<{
@@ -293,7 +295,7 @@ defineExpose({ focusSearch, locateTabInSidebar });
         </template>
       </div>
       <div class="flex-1 min-h-0">
-        <ConnectionTree ref="connectionTreeRef" @open-settings="(initialTab) => emit('open-settings', initialTab)" @add-to-ai="(nodes) => emit('add-to-ai', nodes)" />
+        <ConnectionTree ref="connectionTreeRef" :connection-type-filter="connectionTypeFilter" @open-settings="(initialTab) => emit('open-settings', initialTab)" @add-to-ai="(nodes) => emit('add-to-ai', nodes)" />
       </div>
     </div>
     <div class="panel-resize-handle panel-resize-handle--right" @pointerdown="emit('startResize', $event)" />

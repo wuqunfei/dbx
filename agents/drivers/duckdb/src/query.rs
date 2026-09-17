@@ -450,6 +450,7 @@ pub(crate) fn duckdb_execute_for_database(
     con: &duckdb::Connection,
     attached_names: &[String],
     database: Option<&str>,
+    schema: Option<&str>,
     sql: &str,
     max_rows: Option<usize>,
 ) -> Result<db::QueryResult, String> {
@@ -461,9 +462,21 @@ pub(crate) fn duckdb_execute_for_database(
         };
         con.execute_batch(&format!("USE {}", duckdb_quote_ident(&catalog))).map_err(|e| e.to_string())?;
     }
+    // Set unconditionally on every call, like the USE above, and defaulted to "main" when no
+    // schema was picked — not skipped. This connection is shared across every query tab
+    // targeting the same catalog, so an earlier call's `SET schema` otherwise remains in
+    // effect (DuckDB session state, not scoped to one call) and leaks into a later call that
+    // didn't ask for it, resolving an unqualified table reference against whatever schema
+    // some unrelated query last left the connection in.
+    let schema = schema.map(str::trim).filter(|schema| !schema.is_empty()).unwrap_or("main");
+    con.execute_batch(&format!("SET schema = {}", duckdb_quote_string(schema))).map_err(|e| e.to_string())?;
     duckdb_execute_with_max_rows(con, sql, max_rows)
 }
 
 fn duckdb_quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn duckdb_quote_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }

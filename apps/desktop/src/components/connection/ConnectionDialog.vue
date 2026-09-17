@@ -279,6 +279,7 @@ const props = defineProps<{
   prefillConfig?: ConnectionDeepLinkDraft | null;
   pluginProvider?: PluginCenterFocus | null;
   initialTab?: ConfigTab;
+  restrictToDbTypes?: readonly DatabaseType[];
 }>();
 
 const emit = defineEmits<{
@@ -3048,8 +3049,9 @@ const dbCategories = computed<DbCategory[]>(() => {
   const categories: DbCategory[] = dbCategoryDefinitions.map((category) => ({
     key: category.key,
     title: t(category.titleKey),
-    options: dbOptions.filter((option) => category.optionValues.includes(option.value) && !hiddenPickerOptionTypes.has(option.value)),
+    options: dbOptions.filter((option) => category.optionValues.includes(option.value) && !hiddenPickerOptionTypes.has(option.value) && (!props.restrictToDbTypes || props.restrictToDbTypes.includes(option.value as DatabaseType))),
   }));
+  if (props.restrictToDbTypes) return categories.filter((category) => category.options.length > 0);
   const pluginOptions: DbOption[] = pluginConnectionProviders.value.map((entry) => ({
     value: pluginConnectionProviderOptionValue(entry.plugin.manifest.id, entry.contribution.id),
     label: entry.contribution.label,

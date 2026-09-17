@@ -1973,8 +1973,9 @@ async fn do_execute_typed(
             }
             let sql = sql.to_string();
             let database = database.map(str::to_string);
+            let schema = schema.map(str::to_string);
             let max_rows = options.max_rows;
-            match client.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await {
+            match client.execute_typed(database, schema, sql, max_rows, cancel_token, query_timeout).await {
                 Ok(result) => Ok(result),
                 Err(error) => {
                     let is_control_error = error.message == QUERY_CANCELED
